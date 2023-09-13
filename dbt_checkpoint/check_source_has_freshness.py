@@ -8,6 +8,8 @@ from dbt_checkpoint.tracking import dbtCheckpointTracking
 from dbt_checkpoint.utils import (
     JsonOpenError,
     add_default_args,
+    add_dbt_cmd_args,
+    add_dbt_cmd_model_args,
     get_dbt_manifest,
     get_source_schemas,
     red,
