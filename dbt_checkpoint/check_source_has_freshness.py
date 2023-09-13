@@ -57,7 +57,9 @@ def has_freshness(paths: Sequence[str], required_freshness: Set[str]) -> Dict[st
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     add_default_args(parser)
-
+    add_dbt_cmd_args(parser)
+    add_dbt_cmd_model_args(parser)
+    
     parser.add_argument(
         "--freshness",
         nargs="+",
