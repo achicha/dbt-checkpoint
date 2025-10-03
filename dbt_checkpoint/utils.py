@@ -1,18 +1,12 @@
 import argparse
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from typing import Dict
-from typing import Generator
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Set
-from typing import Text
-from typing import Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Set, Text, Union
+
 
 from yaml import safe_load
 
@@ -93,6 +87,13 @@ class SourceSchema:
     prefix: str = "source"
 
 
+@dataclass
+class GenericDbtObject:
+    name: str
+    filename: str
+    schema: Dict[str, Any]
+
+
 def cmd_output(
     *cmd: str,
     expected_code: Optional[int] = 0,
@@ -122,6 +123,11 @@ def paths_to_dbt_models(
     return [prefix + Path(path).stem + postfix for path in paths]
 
 
+def checkpoint_safe_load(stream):
+    # FIXME: temporary fix for YAML incompatibility of safe_load with empty files
+    return safe_load(stream) or {}
+
+
 def get_json(json_filename: str) -> Dict[str, Any]:
     try:
         file_content = Path(json_filename).read_text(encoding="utf-8")
@@ -133,7 +139,11 @@ def get_json(json_filename: str) -> Dict[str, Any]:
 def get_config_file(config_file_path: str) -> Dict[str, Any]:
     try:
         path = Path(config_file_path)
-        config = safe_load(path.open())
+        if not path.exists():
+            alt_path = path.with_suffix(".yml" if path.suffix == ".yaml" else ".yaml")
+            if alt_path.exists():
+                path = alt_path
+        config = checkpoint_safe_load(path.open())
         check_yml_version(config_file_path, config)
     except FileNotFoundError:
         config = {}
@@ -144,6 +154,7 @@ def get_models(
     manifest: Dict[str, Any],
     filenames: Set[str],
     include_ephemeral: bool = False,
+    include_disabled: bool = False,
 ) -> Generator[Model, None, None]:
     nodes = manifest.get("nodes", {})
     for key, node in nodes.items():
@@ -155,10 +166,23 @@ def get_models(
             and node.get("config", {}).get("materialized") == "ephemeral"
         ):
             continue
+        # In case a disabled model is still in `nodes`
+        if not include_disabled and not node.get("config", {}).get("enabled", True):
+            continue
         split_key = key.split(".")
-        filename = split_key[-1]
-        if filename in filenames and split_key[0] == "model":
-            yield Model(key, node.get("name"), filename, node)  # pragma: no mutate
+        # Versions are supported since dbt-core 1.5
+        if node.get("version") and split_key[-1] == f"v{node.get('version')}":
+            # dbt versioned filenames can be either `model_name` or `model_name_v{version}`
+            filename_candidates = [
+                f"{split_key[-2]}",
+                f"{split_key[-2]}_v{node.get('version')}",
+            ]
+        else:
+            filename_candidates = [split_key[-1]]
+        if split_key[0] == "model":
+            for fn in filename_candidates:
+                if fn in filenames:
+                    yield Model(key, node.get("name"), fn, node)  # pragma: no mutate
 
 
 def get_ephemeral(
@@ -176,6 +200,51 @@ def get_ephemeral(
     return output
 
 
+def get_snapshot_filenames(
+    manifest: Dict[str, Any],
+) -> List[str]:
+    output = []
+    nodes = manifest.get("nodes", {})
+    for key, node in nodes.items():  # pragma: no cover
+        if not node.get("config", {}).get("materialized") == "snapshot":
+            continue
+        split_key = key.split(".")
+        filename = split_key[-1]
+        if split_key[0] == "snapshot":
+            output.append(filename)
+    return output
+
+
+def get_snapshots(
+    manifest: Dict[str, Any], filenames: Set[str]
+) -> Generator[GenericDbtObject, None, None]:
+    nodes = manifest.get("nodes", {})
+    for key, node in nodes.items():
+        if not node.get("config", {}).get("materialized") == "snapshot":
+            continue
+        split_key = key.split(".")
+        filename = split_key[-1]
+        if filename in filenames and split_key[0] == "snapshot":
+            yield GenericDbtObject(
+                node.get("name"), filename, node
+            )  # pragma: no mutate
+
+
+def get_tests(
+    manifest: Dict[str, Any], filenames: Set[str]
+) -> Generator[GenericDbtObject, None, None]:
+    nodes = manifest.get("nodes", {})
+    for key, node in nodes.items():
+        if not node.get("config", {}).get("materialized") == "test":
+            continue
+        split_key = key.split(".")
+        filename = split_key[-1]
+        if filename in filenames and split_key[0] == "test":
+            yield GenericDbtObject(
+                node.get("name"), filename, node
+            )  # pragma: no mutate
+
+
 def get_macros(
     manifest: Dict[str, Any],
     filenames: Set[str],
@@ -186,6 +255,20 @@ def get_macros(
         filename = split_key[-1]
         if filename in filenames and split_key[0] == "macro":
             yield Macro(key, macro.get("name"), filename, macro)  # pragma: no mutate
+
+
+def get_seeds(
+    manifest: Dict[str, Any],
+    filenames: Set[str],
+) -> Generator[GenericDbtObject, None, None]:
+    seeds = manifest.get("nodes", {})
+    for key, seed in seeds.items():
+        split_key = key.split(".")
+        filename = split_key[-1]
+        if filename in filenames and split_key[0] == "seed":
+            yield GenericDbtObject(
+                seed.get("name"), filename, seed
+            )  # pragma: no mutate
 
 
 def get_flags(flags: Optional[Sequence[str]] = None) -> List[str]:
@@ -202,11 +285,32 @@ def get_macro_sqls(paths: Sequence[str], manifest: Dict[str, Any]) -> Dict[str, 
     return {k: v for k, v in sqls.items() if k in macro_sqls and v == macro_sqls[k]}
 
 
-def get_model_sqls(paths: Sequence[str], manifest: Dict[str, Any]) -> Dict[str, Any]:
+def get_disabled(manifest: Dict[str, Any], include_disabled: bool = False) -> List[str]:
+    output = []
+    disabled = manifest.get("disabled", {})
+    for key, node in disabled.items():
+        split_key = key.split(".")
+        filename = split_key[-1]
+        if split_key[0] == "model":
+            if include_disabled:
+                continue
+            output.append(filename)
+
+    return output
+
+
+def get_model_sqls(
+    paths: Sequence[str], manifest: Dict[str, Any], include_disabled: bool = False
+) -> Dict[str, Any]:
     ephemeral = get_ephemeral(manifest)
     sqls = get_filenames(paths, [".sql"])
     macro_sqls = get_macro_sqls(paths, manifest)
-    return {k: v for k, v in sqls.items() if k not in macro_sqls and k not in ephemeral}
+    disabled = get_disabled(manifest, include_disabled)
+    return {
+        k: v
+        for k, v in sqls.items()
+        if k not in macro_sqls and k not in ephemeral and k not in disabled
+    }
 
 
 def get_model_schemas(
@@ -214,7 +318,7 @@ def get_model_schemas(
 ) -> Generator[ModelSchema, None, None]:
     for yml_file in yml_files:
         with open(yml_file, "r") as file:
-            schema = safe_load(file)
+            schema = checkpoint_safe_load(file)
             for model in schema.get("models", []):
                 if isinstance(model, dict) and model.get("name"):
                     model_name = model.get("name", "")  # pragma: no mutate
@@ -231,7 +335,7 @@ def get_macro_schemas(
     yml_files: Sequence[Path], filenames: Set[str], all_schemas: bool = False
 ) -> Generator[MacroSchema, None, None]:
     for yml_file in yml_files:
-        schema = safe_load(yml_file.open())
+        schema = checkpoint_safe_load(yml_file.open())
         for macro in schema.get("macros", []):
             if isinstance(macro, dict) and macro.get("name"):
                 macro_name = macro.get("name", "")  # pragma: no mutate
@@ -245,11 +349,15 @@ def get_macro_schemas(
 
 
 def get_source_schemas(
-    yml_files: Sequence[Path],
+    yml_files: Sequence[Path], include_disabled: bool = False
 ) -> Generator[SourceSchema, None, None]:
     for yml_file in yml_files:
-        schema = safe_load(yml_file.open())
+        schema = checkpoint_safe_load(yml_file.open())
         for source in schema.get("sources", []):
+            if not include_disabled and not source.get("config", {}).get(
+                "enabled", True
+            ):
+                continue
             source_name = source.get("name")
             tables = source.pop("tables", [])
             for table in tables:
@@ -261,6 +369,20 @@ def get_source_schemas(
                     source_schema=source,
                     table_schema=table,
                 )
+
+
+def get_exposures(
+    yml_files: Sequence[Path],
+) -> Generator[GenericDbtObject, None, None]:
+    for yml_file in yml_files:
+        schema = checkpoint_safe_load(yml_file.open())
+        for exposure in schema.get("exposures", []):
+            exposure_name = exposure.get("name")
+            yield GenericDbtObject(
+                name=exposure_name,
+                filename=yml_file.stem,
+                schema=exposure,
+            )
 
 
 def obj_in_deps(obj: Any, dep_name: str) -> bool:
@@ -347,6 +469,15 @@ def run_dbt_cmd(cmd: Sequence[Any]) -> int:
     return status_code
 
 
+def get_manifest_node_from_file_path(
+    manifest: Dict[str, Any], file_path: str
+) -> Dict[str, Any]:
+    for node in manifest.get("nodes", {}).values():
+        if node.get("original_file_path", "") in file_path:
+            return node
+    return {}
+
+
 def add_filenames_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "filenames",
@@ -407,12 +538,21 @@ def add_exclude_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_disabled_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="Flagto include disabled models",
+    )
+
+
 def add_default_args(parser: argparse.ArgumentParser) -> None:
     add_filenames_args(parser)
     add_manifest_args(parser)
     add_config_args(parser)
     add_tracking_args(parser)
     add_exclude_args(parser)
+    add_disabled_args(parser)
 
 
 def add_dbt_cmd_args(parser: argparse.ArgumentParser) -> None:
@@ -448,6 +588,21 @@ def add_dbt_cmd_model_args(parser: argparse.ArgumentParser) -> None:
         help="""pre-commit-dbt is by default running changed files.
         If you need to override that, e.g. in case of Slim CI (state:modified),
         you can use this option.""",
+    )
+
+
+def add_meta_keys_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--meta-keys",
+        nargs="+",
+        required=True,
+        help="List of required key in meta part of model.",
+    )
+    parser.add_argument(
+        "--allow-extra-keys",
+        action="store_true",
+        required=False,
+        help="Whether extra keys are allowed.",
     )
 
 
@@ -506,6 +661,25 @@ class ParseDict(argparse.Action):
                 value = split_items[1]
 
                 result[key] = value
+
+        setattr(namespace, self.dest, result)
+
+
+class ParseJson(argparse.Action):
+    """Parse a JSON string into a dictionary"""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Text,
+        option_string: Optional[str] = None,
+    ) -> None:
+        """Perform the parsing"""
+        result = {}
+
+        if values:
+            result = json.loads(values)
 
         setattr(namespace, self.dest, result)
 
@@ -598,7 +772,8 @@ def get_missing_file_paths(
             for filename in paths_with_missing
             if not exclude_re.search(filename)
         ]
-    return paths_with_missing
+    file_paths_with_missing = [p for p in paths_with_missing if not os.path.isdir(p)]
+    return file_paths_with_missing
 
 
 def red(string: Optional[Any]) -> str:
@@ -648,3 +823,28 @@ def get_dbt_catalog(args):  # type: ignore
         return get_json(f"{config_project_dir}/target/catalog.json")
     else:
         return get_json(catalog_path)
+
+
+def validate_meta_keys(
+    obj: GenericDbtObject,
+    meta_keys: Sequence[str],
+    meta_set: Set,
+    allow_extra_keys: bool,
+):
+    meta = set(obj.schema.get("meta", {}).keys())
+    if allow_extra_keys:
+        diff = not meta_set.issubset(meta)
+    else:
+        diff = not (meta_set == meta)
+    if diff:
+        print(
+            f"{obj.name} meta keys don't match. \n"
+            f"Provided: {yellow(', '.join(list(meta_keys)))}\n"
+            f"Actual: {red(', '.join(list(meta)))}\n"
+        )
+        return 1
+    return 0
+
+
+def strings_differ_in_case(str1: str, str2: str) -> bool:
+    return str1.lower() == str2.lower() and str1 != str2
